@@ -1,0 +1,267 @@
+#!/usr/bin/env perl
+# -*- coding: utf-8 -*-
+#
+# show events
+#
+use strict;
+use warnings;
+use utf8;
+use File::Basename 'basename';
+use Config::Tiny;
+use HTTP::Date 'str2time';
+use Data::Dumper;
+
+my $DEBUG = -f '.debug';
+my $CRON_INTERVAL = 5; # minutes
+
+=encoding utf8
+
+=head1 NAME
+
+events - show events
+
+=head2 ~/.events Format
+
+; -*- coding: utf-8 -*-
+
+interval = 5 ; minutes
+
+[taiso]
+title    = 体操のお兄さん 2013
+start    = 2013/07/23 16:00
+end      = 2013/08/27 10:00
+message  = やってるみたいです
+uri      = http://tinyurl.com/l4pd8bu
+time     = 0:05, 12:05, 16:05, 20:05, 23:00, 2013/08/27 9:00,*
+
+; 表示抑止時間帯指定 start-end (wday)
+suspend  = 10:00-16:00 2
+; いずれかの条件に当てはまる場合はtitleの表示をしない
+notitle  = daily last
+; いずれかの条件に当てはまる場合はuriの表示をしない
+nouri    = daily last
+
+; 毎日の残り時間が指定時間以下ならmessageを置き換えて表示
+daily    = 5
+dailyfmt = あと%d時間で今日のスタンプがもらえなくなります
+
+; 最終日まで指定日数以下ならmessageに続けて表示
+days     = 3
+daysfmt  = (あと%d日!)
+
+; 最終日の終了時刻まで指定時間以内になった時のメッセージを変更
+last     = 10
+lastfmth = あと%d時間くらいで終わります
+lastfmtm = あと%d分くらいで終わります	; 1時間以内ならこちらを使う
+
+=head2 start, end format
+
+YYYY/mm/dd HH:MM
+
+=head2 suspend format
+
+HH:MM-HH:MM
+HH:MM-HH:MM n				(n=0-6) 曜日指定
+YYYY/mm/dd-YYYY/mm/dd
+YYYY/mm/dd-YYYY/mm/dd n			(n=0-6) 曜日指定
+YYYY/mm/dd HH:MM-YYYY/mm/dd HH:MM
+YYYY/mm/dd HH:MM-YYYY/mm/dd HH:MM n	(n=0-6) 曜日指定
+
+=head2 time format
+
+*			everytime
+HH			every HH:00
+HH:MM			every HH:MM
+YYYY/mm/dd HH		YYYY/mm/dd HH:00
+YYYY/mm/dd HH:MM	YYYY/mm/dd HH:MM
+
+=cut
+
+sub update_format {
+    my ($event, $now, $hour, $min) = @_;
+    my $title = $event->{title} or return;
+    my $uri   = $event->{uri};
+    utf8::decode($title);
+    my $quri  = $uri ? sprintf('%s#%02d%02d', $uri, $hour, $min) : '';
+
+    my $heading = '開催中です';
+    if ($event->{message}) {
+	$heading = $event->{message};
+	utf8::decode($heading);
+    }
+
+    my $end = str2time($event->{end}) || 0xFFFF_FFFF;
+    my ($daily, $days, $last);
+    my $rest = $end - $now;
+    if ($event->{daily}) {
+	my $daily_rest = 24 - (localtime($now))[2];
+	if ($daily_rest <= $event->{daily}) {
+	    my $fmt = '(本日残り%d時間)';
+	    if ($event->{dailyfmt}) {
+		$fmt = $event->{dailyfmt};
+		utf8::decode($fmt);
+	    }
+	    $heading = sprintf($fmt, $daily_rest);
+	    $daily++;
+	}
+    }
+    if ($event->{days}) {
+	my $day_rest = int($rest / 86400);
+	if (0 < $day_rest and $day_rest < $event->{days}) {
+	    my $fmt = '(あと%d日)';
+	    if ($event->{daysfmt}) {
+		$fmt = $event->{daysfmt};
+		utf8::decode($fmt);
+	    }
+	    $heading .= sprintf($fmt, $day_rest + 1);
+	    $days++;
+	}
+    }
+    if ($event->{last}) {
+	my $last_rest = int($rest / 3600);
+	if ($last_rest < $event->{last}) {
+	    if ($last_rest) {
+		my $fmt = 'あと%d時間くらいで終了です';
+		if ($event->{lastfmth}) {
+		    $fmt = $event->{lastfmth};
+		    utf8::decode($fmt);
+		}
+		$heading = sprintf($fmt, $last_rest + 1);
+		$last++;
+	    } else {
+		my $fmt = 'あと%d分くらいで終了です';
+		if ($event->{lastfmtm}) {
+		    $fmt = $event->{lastfmtm};
+		    utf8::decode($fmt);
+		}
+		$heading = sprintf($fmt, int($rest / 60) + 1);
+		$last++;
+	    }
+	}
+    }
+
+    my $mes;
+    if ($event->{nouri}) {
+	if (($daily and $event->{daily} and index($event->{nouri}, 'daily') >= 0)
+	    or ($days and $event->{days} and index($event->{nouri}, 'days') >= 0)
+	    or ($last and $event->{last} and index($event->{nouri}, 'last') >= 0)
+	) {
+	    $quri = '';
+	}
+    }
+    if ($event->{notitle}) {
+	if (($daily and $event->{daily} and index($event->{notitle}, 'daily') >= 0)
+	    or ($days and $event->{days} and index($event->{notitle}, 'days') >= 0)
+	    or ($last and $event->{last} and index($event->{notitle}, 'last') >= 0)
+	) {
+	    $mes = sprintf('%s %s', $heading, $quri);
+	}
+    }
+    $mes ||= sprintf('「%s」%s %s', $title, $heading, $quri);
+    update($mes);
+}
+
+sub is_suspend {
+    my ($suspend, $now) = @_;
+
+    return 0 unless $suspend;
+
+    foreach my $datetime (split(',', $suspend)) {
+	my ($start, $tend) = split('-', $datetime);
+	my ($end, $eend, $wday) = split(/\s+/o, $tend, 3);
+	#print Dumper [$end, $eend, $wday];
+	my @now = localtime($now);
+
+	# 時間指定のみの場合は起動時の日付を補完
+	if (index($start, '/') < 0 and index($start, ':') >= 0) {
+	    $start = sprintf('%d/%d/%d %s', $now[5] + 1900, $now[4] + 1, $now[3], $start);
+	}
+	if (index($end, '/') < 0 and index($end, ':') >= 0) {
+	    $end = sprintf('%d/%d/%d %s', $now[5] + 1900, $now[4] + 1, $now[3], $end);
+	} elsif (index($end, '/') >= 0 and index($end, ':') < 0) {
+	    if ($eend) {
+		$end .= ' ' . $eend;
+	    } else {
+		# 終日
+		$end = scalar localtime(str2time($end) + 86400);
+	    }
+	}
+	# 曜日の補完
+	$wday = $eend if (defined($eend) and $eend =~ /^[0-7]$/o and ! defined($wday));
+
+	$start = str2time($start);
+	$end   = str2time($end);
+
+	#print Dumper { suspend => $suspend, start => scalar localtime($start), end => scalar localtime($end), wday => $wday };
+
+	# 曜日指定がある場合
+	return 1 if (defined($wday) and $wday == $now[6] and $start <= $now and $now < $end);
+	# 曜日指定がない場合
+	return 1 if (! defined($wday) and $start <= $now and $now < $end);
+    }
+
+    0;
+}
+
+sub events {
+    my $faketime = shift;
+
+    my $prog = basename($0);
+    my $ini = Config::Tiny->read($ENV{HOME}.'/.'.$prog);
+    die Config::Tiny->errstr unless $ini;
+
+    $CRON_INTERVAL = $ini->{_}{interval} if $ini->{_}{interval};
+
+    foreach my $event (grep {$_ ne '_'} keys %$ini) {
+	my $start = str2time($ini->{$event}{start}) || 0;
+	my $end   = str2time($ini->{$event}{end}  ) || 0xFFFF_FFFF;
+	my $now   = $faketime || time;
+
+	#print Dumper { title => $event, start => scalar localtime($start), end => scalar localtime($end) };
+
+	if ($start <= $now and $now < $end) {
+	    next if is_suspend($ini->{$event}{suspend}, $now);
+
+	    my ($min, $hour) = (localtime($now))[1,2];
+	    my $timeband = $ini->{$event}{time} || '*';
+	    foreach my $time (map {s/^\s+|\s+$//g; $_} split(',', $timeband)) {
+		if (index($time, '/') >= 0) {
+		    # 日付付き時刻 (YYYY/mm/dd HH)
+		    my ($date, $chour, $cmin) = split(/\s+/o, $time, 2);
+		    if (index($chour, ':') >= 0) {
+			($chour, $cmin) = split(':', $chour, 3);
+		    } else {
+			$cmin = 0;
+		    }
+		    my $diff = $now - (str2time($date) + $chour * 3600 + $cmin * 60);
+		    if (0 <= $diff and $diff < $CRON_INTERVAL * 60) {
+			update_format($ini->{$event}, $now, $chour, $cmin);
+		    }
+		} else {
+		    # 日付なし時刻
+		    ($time) = localtime($now) =~ /(\d\d:\d\d):/o if ($time eq '*');
+
+		    my ($chour, $cmin) = split(':', $time);
+		    my $say = 0;
+		    if ($cmin) {
+			my $mindiff = $min - $cmin;
+			if (0 <= $mindiff and $mindiff < $CRON_INTERVAL and $hour == $chour) {
+			    $say++;
+			}
+		    } elsif ($hour == $time and $min < $CRON_INTERVAL) {
+			$say++;
+		    }
+		    update_format($ini->{$event}, $now, $hour, $min) if $say;
+		}
+	    }
+	}
+    }
+}
+
+sub update {
+    my $mes = shift;
+    utf8::encode($mes);
+    print($mes, "\n");
+}
+
+events();
