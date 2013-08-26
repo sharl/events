@@ -264,4 +264,4 @@ sub update {
     print($mes, "\n");
 }
 
-events();
+events($ARGV[0] =~ /^\d+$/o ? int($ARGV[0]) : undef);
